@@ -18,24 +18,29 @@ Packs are built by [`tools/build-docs-corpus.py`](tools/build-docs-corpus.py) (s
 
 ## CI and releases
 
-[`.github/workflows/pack.yml`](.github/workflows/pack.yml) builds and publishes packs. There is no push,
-PR or scheduled run.
+Packs are **built on a maintainer host** and **verified and published by CI**
+([`.github/workflows/pack.yml`](.github/workflows/pack.yml)). CI does not build: a hosted runner cannot finish
+the ~6,000 page fetches before gitcode throttles it. There is no push, PR or scheduled run.
+
+1. The maintainer builds the pack locally, writes its `.sha256`, and uploads zip + `.sha256` + `manifest.json`
+   as a **draft** release named `openharmony-zh-cn-<YYYYMMDD>-<commit8>` (a draft is never `releases/latest`).
+2. The maintainer pushes a tag with exactly that name.
+3. CI downloads the draft and lists gitcode's tree at the manifest's commit (~130 API requests, no page fetch).
+   It then checks:
+   - every page's git blob sha1 matches that tree, and both sides list the same pages;
+   - the page count is at least the floor (≥ 5000 and ≥ 90% of the latest pack);
+   - the pack is newer than `releases/latest`;
+   - the manifest fields, sha256 and asset name match the tag, and the `.sha256` is present and well-formed.
+4. Only when every check passes does CI publish the draft as the latest release and read the manifest back from
+   the URL oh uses. Any failure leaves it a draft and states the reason.
 
 | Event | Runs | Publishes |
 |---|---|---|
-| push of a tag named exactly `openharmony-zh-cn-<YYYYMMDD>-<commit8>` | yes | yes, if the name matches the gitcode commit, the pack is newer than `releases/latest`, and every check passes |
-| Actions → Run workflow (`workflow_dispatch`, optional `commit`) | yes | **no** — builds, verifies, keeps a 1-day artifact |
+| push of a tag named exactly `openharmony-zh-cn-<YYYYMMDD>-<commit8>` | verifies that draft | yes, if every check passes; an already-published release is a no-op |
+| Actions → Run workflow (`workflow_dispatch`, optional `tag`; empty = latest) | the same verification | **no** |
 
-```bash
-python3 -I tools/build-docs-corpus.py --resolve          # the tag name for gitcode master now (--commit <hex> to pin)
-git tag -a <name> -m <name> && git push origin <name>    # publish
-```
-
-Before publishing, the workflow runs the offline self-test and checks the page count against a floor
-(≥ 5000 and ≥ 90% of the latest pack). It re-checks every page's git blob sha1 after unzipping, checks the
-manifest against the asset name rule, and writes and checks the `.sha256`. The release is created as a draft
-and made the latest one only after every asset has uploaded. A tag whose release is already published is
-a no-op. Rationale: [`docs/research/2026-10-27-ci-for-docs-packs.md`](docs/research/2026-10-27-ci-for-docs-packs.md).
+The complete command sequence for a release is in [`CLAUDE.md`](CLAUDE.md) (Releasing). The rationale and the
+three CI runs that changed the route are in [`docs/research/2026-10-27-ci-for-docs-packs.md`](docs/research/2026-10-27-ci-for-docs-packs.md).
 
 ## License and attribution
 

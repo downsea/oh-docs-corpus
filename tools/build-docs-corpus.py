@@ -3,8 +3,11 @@
 
 The canonical copy lives in `downsea/oh-docs-corpus` (`tools/`); oh-cli keeps none
 (it moved here from oh-cli `scripts/build-docs-corpus.py`, oh #741). It is not shipped
-with oh. It never publishes: it writes files into the directory you name, and the
-`pack` workflow of this repository (`.github/workflows/pack.yml`) publishes them.
+with oh. It never publishes. Route (maintainer ruling 2026-10-27, research §9): the
+maintainer BUILDS on a developer host (a hosted runner is throttled by gitcode's raw
+host), uploads the files as a DRAFT release, and pushes the tag; the `pack` workflow
+(`.github/workflows/pack.yml`) only VERIFIES the draft (`--verify --against-gitcode`)
+and turns it into the latest release.
 
 What a build does (the same steps as `oh docs update`'s gitcode fallback, so the two
 routes produce one archive shape):
@@ -29,12 +32,17 @@ Modes (standard library only; run it isolated, with directories as arguments):
 
     python3 -I tools/build-docs-corpus.py --self-test                # offline, no network
     python3 -I tools/build-docs-corpus.py --resolve [--commit SHA]   # 1 GET, prints JSON, writes nothing
-        [--previous-manifest FILE --require-newer]
+        [--previous-manifest FILE --require-newer] [--shell]
     python3 -I tools/build-docs-corpus.py --out DIR [--commit SHA]   # the build (~6,100 GETs)
         [--min-documents N] [--previous-manifest FILE] [--pages-tsv FILE]
-    python3 -I tools/build-docs-corpus.py --verify DIR               # offline check of a built DIR
-        [--pages-tsv FILE] [--min-documents N] [--previous-manifest FILE]
-        [--expect-asset NAME] [--require-newer]
+    python3 -I tools/build-docs-corpus.py --verify DIR               # check a pack directory
+        [--against-gitcode | --pages-tsv FILE] [--min-documents N] [--previous-manifest FILE]
+        [--expect-asset NAME] [--require-newer] [--require-sidecar]
+
+`--verify --against-gitcode` lists gitcode's tree at the manifest's commit (~130 API
+GETs, no raw fetch) and requires every page of the zip to hash to the git blob sha1
+listed for its path, with equal path sets — the check CI runs, and the one to run
+locally before uploading. `--pages-tsv` is the offline variant (the build's listing).
 
 `--commit` takes 7-40 lowercase hex; the build always pins the full 40-hex sha gitcode
 returns, and refuses an answer that does not start with the prefix asked for.
@@ -421,6 +429,50 @@ def build(
 # ---------------------------------------------------------------------------
 
 
+def read_pages_tsv(path: str) -> dict[str, str]:
+    want: dict[str, str] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            s, _, p = line.rstrip("\n").partition("\t")
+            if not HEX40.match(s) or not p or p in want:
+                die(f"bad pages-tsv line {line!r}")
+            want[p] = s
+    return want
+
+
+def gitcode_pages(http, commit: str, workers: int, api: str = API) -> tuple[str, str, dict[str, str]]:
+    """gitcode's own listing of `commit`: (sha, committed_at, {path: blob sha1}).
+
+    API calls only (~130 for zh application-dev) — no page is fetched from raw.
+    """
+    sha, tree, date = resolve_commit(http, api, commit)
+    zh = child_tree(http, api, tree, "zh-cn")
+    app = child_tree(http, api, zh, "application-dev")
+    return sha, date, dict(list_pages(http, api, app, workers))
+
+
+def verify_against_gitcode(http, out_dir: str, workers: int = 8, api: str = API, **kw) -> dict:
+    """`verify` with the expected page set taken from gitcode's tree at the manifest's commit.
+
+    This is what CI runs on a draft: every page of the zip must hash to the git blob
+    sha1 gitcode lists for that path at that commit, and the two path sets must be
+    equal — the same proof a build gives, without the ~6,000 raw fetches a hosted
+    runner cannot complete (research §9).
+    """
+    m = read_manifest(os.path.join(out_dir, "manifest.json"))
+    commit = m.get("commit")
+    if not isinstance(commit, str) or not HEX40.match(commit):
+        die(f"manifest commit is not 40 hex: {commit!r}")
+    sha, date, want = gitcode_pages(http, commit, workers, api)
+    if sha != commit or date != m.get("committed_at"):
+        die(f"gitcode says {sha} ({date}); the manifest says {commit} ({m.get('committed_at')})")
+    if not want:
+        die("gitcode listed no pages under zh-cn/application-dev")
+    rep = verify(out_dir, want=want, **kw)
+    rep["listing"] = "gitcode"
+    return rep
+
+
 def verify(
     out_dir: str,
     pages_tsv: str | None = None,
@@ -428,8 +480,17 @@ def verify(
     previous: dict | None = None,
     expect_asset: str | None = None,
     require_newer: bool = False,
+    want: dict[str, str] | None = None,
+    require_sidecar: bool = False,
 ) -> dict:
-    """Re-check a built directory end to end; die on the first failure, else a report."""
+    """Re-check a built directory end to end; die on the first failure, else a report.
+
+    The expected pages come from `want` ({path: blob sha1}, e.g. gitcode's tree) or
+    from `pages_tsv` (the build's own listing); with neither, page hashes are not
+    re-checked (`blob_sha1_checked` is 0).
+    """
+    if want is not None and pages_tsv is not None:
+        die("give either a pages-tsv or a gitcode listing, not both")
     m = read_manifest(os.path.join(out_dir, "manifest.json"))
     if set(m) != MANIFEST_KEYS:
         die(f"manifest fields are {sorted(m)}, the contract is {sorted(MANIFEST_KEYS)}")
@@ -460,6 +521,8 @@ def verify(
     if len(data) > OH_MAX_ZIP_BYTES:
         die(f"{asset} is {len(data)} B, past oh's {OH_MAX_ZIP_BYTES} B limit")
     sidecar = os.path.join(out_dir, asset + ".sha256")
+    if require_sidecar and not os.path.exists(sidecar):
+        die(f"{asset}.sha256 is missing")
     if os.path.exists(sidecar):
         with open(sidecar, "rb") as f:
             got = f.read()
@@ -502,16 +565,15 @@ def verify(
 
     checked = 0
     if pages_tsv is not None:
-        want: dict[str, str] = {}
-        with open(pages_tsv, encoding="utf-8") as f:
-            for line in f:
-                s, _, p = line.rstrip("\n").partition("\t")
-                if not HEX40.match(s) or not p or p in want:
-                    die(f"bad pages-tsv line {line!r}")
-                want[p] = s
+        want = read_pages_tsv(pages_tsv)
+    if want is not None:
         have = {n[len("docs/"):] for n in docs}
         if set(want) != have:
-            die(f"pages-tsv and the archive disagree: {len(set(want) - have)} listed but missing, {len(have - set(want))} extra")
+            missing, extra = sorted(set(want) - have), sorted(have - set(want))
+            die(
+                f"the listing and the archive disagree: {len(missing)} listed but not in the archive "
+                f"{missing[:3]}, {len(extra)} in the archive but not listed {extra[:3]}"
+            )
         for n in docs:
             if git_blob_sha1(z.read(n)) != want[n[len("docs/"):]]:
                 die(f"{n!r} does not match its git blob sha1")
@@ -647,6 +709,27 @@ def self_test() -> int:
         older = {"commit": "a" * 40, "committed_at": "2026-10-20T09:00:00+08:00", "documents": 2}
         rep = verify(out, tsv, previous=older, expect_asset=m["asset"], require_newer=True)
         assert rep["blob_sha1_checked"] == 2 and rep["newer_than_previous"] is True and rep["floor"] == 2, rep
+        # --verify --against-gitcode: the listing comes from gitcode's tree, API calls only.
+        g = FakeHttp(routes)
+        rep = verify_against_gitcode(g, out, previous=older, expect_asset=m["asset"], require_newer=True, require_sidecar=True)
+        assert rep["blob_sha1_checked"] == 2 and rep["listing"] == "gitcode", rep
+        assert g.seen and not any(u.startswith(RAW) for u in g.seen), g.seen
+        # gitcode's tree disagreeing with a page (a blob sha) or with the page set is red.
+        drift = dict(routes)
+        moved = [dict(e, sha="8" * 40) if e.get("path") == "ui/布局 演示.md" else e for e in entries]
+        drift[f"{API}/repos/{REPO}/git/trees/{app_t}?recursive=1&per_page=100&page=1"] = j({"tree": moved})
+        expect_die(lambda: verify_against_gitcode(FakeHttp(drift), out), "a page whose blob sha1 gitcode does not list")
+        more = dict(routes)
+        more[f"{API}/repos/{REPO}/git/trees/{app_t}?recursive=1&per_page=100&page=1"] = j(
+            {"tree": entries + [{"type": "blob", "path": "new.md", "sha": "9" * 40}]}
+        )
+        expect_die(lambda: verify_against_gitcode(FakeHttp(more), out), "a page gitcode lists but the archive lacks")
+        redate = dict(routes)
+        redate[f"{API}/repos/{REPO}/commits?sha={commit}&per_page=1"] = j(
+            [dict(head, commit={"tree": {"sha": root_t}, "committer": {"date": "2026-10-28T00:00:00+08:00"}})]
+        )
+        expect_die(lambda: verify_against_gitcode(FakeHttp(redate), out), "a manifest date gitcode does not confirm")
+        expect_die(lambda: verify(out, tsv, want={}), "both a pages-tsv and a listing")
         # ... and red on every way the publish step could be fooled.
         expect_die(lambda: verify(out, expect_asset="openharmony-zh-cn-20261027-00000000.zip"), "a tag / pack mismatch")
         expect_die(lambda: verify(out, min_documents=3), "a pack below the absolute floor")
@@ -661,6 +744,7 @@ def self_test() -> int:
             f.write(f"{m['sha256']} {m['asset']}\n")  # one space: not sha256sum -c format
         expect_die(lambda: verify(out), "a malformed sidecar")
         os.remove(os.path.join(out, m["asset"] + ".sha256"))
+        expect_die(lambda: verify(out, require_sidecar=True), "a missing sidecar when one is required")
         with open(os.path.join(out, "stray.txt"), "w", encoding="utf-8") as f:
             f.write("x")
         expect_die(lambda: verify(out), "a stray file in the pack directory")
@@ -686,7 +770,7 @@ def main() -> int:
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--self-test", action="store_true", help="offline self-check, no network")
     mode.add_argument("--resolve", action="store_true", help="print the commit / version / asset / tag a build would get, as JSON")
-    mode.add_argument("--verify", metavar="DIR", help="offline check of a built directory; prints a JSON report")
+    mode.add_argument("--verify", metavar="DIR", help="check a pack directory (zip + manifest.json [+ .sha256]); prints a JSON report")
     ap.add_argument("--out", help="build: output directory (created); the zip and manifest.json land here")
     ap.add_argument("--commit", help="gitcode openharmony/docs commit (7-40 lowercase hex); default master now")
     ap.add_argument("--concurrency", type=int, default=8)
@@ -695,6 +779,9 @@ def main() -> int:
     ap.add_argument("--pages-tsv", metavar="FILE", help="build: write '<blob sha1>\\t<path>' per page; verify: re-check every page against it")
     ap.add_argument("--expect-asset", metavar="NAME", help="verify: the asset name the pack must have")
     ap.add_argument("--require-newer", action="store_true", help="resolve / verify: refuse a commit not newer than --previous-manifest")
+    ap.add_argument("--against-gitcode", action="store_true", help="verify: re-check every page against gitcode's tree at the manifest's commit (~130 API GETs, no raw fetch)")
+    ap.add_argument("--require-sidecar", action="store_true", help="verify: the <asset>.sha256 must be present")
+    ap.add_argument("--shell", action="store_true", help="resolve: print TAG= / COMMIT= / ASSET= lines for `eval` instead of JSON")
     a = ap.parse_args()
     if a.self_test:
         return self_test()
@@ -704,10 +791,26 @@ def main() -> int:
     if a.resolve:
         r = resolve(Http(), a.commit)
         r["newer_than_previous"] = check_newer(r["commit"], r["committed_at"], previous, a.require_newer)
-        print(json.dumps(r, ensure_ascii=False))
+        if a.shell:
+            # Every value is validated hex / ISO date / the derived name: safe for eval.
+            print(f"TAG={r['tag']}\nCOMMIT={r['commit']}\nASSET={r['asset']}")
+        else:
+            print(json.dumps(r, ensure_ascii=False))
         return 0
     if a.verify:
-        rep = verify(a.verify, a.pages_tsv, a.min_documents, previous, a.expect_asset, a.require_newer)
+        kw = dict(
+            min_documents=a.min_documents,
+            previous=previous,
+            expect_asset=a.expect_asset,
+            require_newer=a.require_newer,
+            require_sidecar=a.require_sidecar,
+        )
+        if a.against_gitcode:
+            if a.pages_tsv:
+                ap.error("--against-gitcode and --pages-tsv are alternatives")
+            rep = verify_against_gitcode(Http(), a.verify, max(1, a.concurrency), **kw)
+        else:
+            rep = verify(a.verify, a.pages_tsv, **kw)
         print(json.dumps(rep, ensure_ascii=False))
         return 0
     if not a.out:
