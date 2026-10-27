@@ -85,6 +85,8 @@ ATTEMPTS = 3
 GET_ATTEMPTS = 4
 GET_TIMEOUT = 60
 THROTTLE_BACKOFF = 15
+THROTTLE_ATTEMPTS = 6
+RETRY_AFTER_CAP = 300
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEXPREFIX = re.compile(r"^[0-9a-f]{7,40}$")
@@ -197,6 +199,15 @@ def check_newer(commit: str, date: str, previous: dict | None, require: bool) ->
     return newer
 
 
+def retry_after(e) -> float | None:
+    """The seconds a throttling answer asks us to wait (Retry-After: <seconds>), capped."""
+    v = (e.headers or {}).get("Retry-After") if hasattr(e, "headers") else None
+    try:
+        return min(float(v), RETRY_AFTER_CAP) if v is not None else None
+    except ValueError:
+        return None
+
+
 class Http:
     """GET with the environment's proxy; `get(url) -> bytes`."""
 
@@ -209,24 +220,33 @@ class Http:
         # slowly — the first CI dry run (run 40469004197) died on one unretried timeout
         # while resolving the tree. A 4xx other than 429 is an answer, never retried.
         req = urllib.request.Request(url, headers={"User-Agent": "oh-docs-corpus build-docs-corpus"})
-        for attempt in range(GET_ATTEMPTS):
+        transient = throttled = 0
+        while True:
             try:
                 with self.opener.open(req, timeout=GET_TIMEOUT) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
-                # 429 and gitcode's 418 are throttling (a hosted runner got a 418 on
-                # its first raw GET right after ~130 API calls, run 40469395436, while
-                # a lone probe from a fresh runner got 200s): back off for longer.
-                throttled = e.code in (418, 429)
-                if not throttled and e.code < 500 or attempt == GET_ATTEMPTS - 1:
-                    raise
-                if throttled:
-                    time.sleep(THROTTLE_BACKOFF * (2**attempt))
+                # 429 and gitcode's 418 are throttling: a hosted runner got a 418 on its
+                # first raw GET right after ~130 API calls (run 40469395436) and a 429 on
+                # its very first API call (run 40480014752), while a lone probe from a
+                # fresh runner got 200s (run 40470642335). Wait as told (Retry-After), else
+                # back off 15 s doubling, for up to THROTTLE_ATTEMPTS answers (~8 min).
+                if e.code in (418, 429):
+                    throttled += 1
+                    if throttled >= THROTTLE_ATTEMPTS:
+                        raise
+                    time.sleep(retry_after(e) or THROTTLE_BACKOFF * (2 ** (throttled - 1)))
                     continue
-            except (TimeoutError, ConnectionError, urllib.error.URLError):
-                if attempt == GET_ATTEMPTS - 1:
+                if e.code < 500:
                     raise
-            time.sleep(2 * (1 + attempt))
+                transient += 1
+                last: Exception = e
+            except (TimeoutError, ConnectionError, urllib.error.URLError) as e:
+                transient += 1
+                last = e
+            if transient >= GET_ATTEMPTS:
+                raise last
+            time.sleep(2 * transient)
         raise AssertionError("unreachable")
 
 
