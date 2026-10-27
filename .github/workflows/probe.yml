@@ -1,0 +1,22 @@
+# TEMPORARY probe (2026-10-27): does raw.gitcode.com answer a GitHub-hosted runner? Deleted after one run.
+name: probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: raw and api reachability
+        run: |
+          for u in \
+            "https://raw.gitcode.com/openharmony/docs/raw/master/LICENSE" \
+            "https://raw.gitcode.com/openharmony/docs/raw/master/zh-cn/application-dev/IDL/Readme-CN.md" \
+            "https://api.gitcode.com/api/v5/repos/openharmony/docs/commits?sha=master&per_page=1" \
+            "https://gitcode.com/openharmony/docs/raw/master/LICENSE"; do
+            out=$(curl -sS -o /dev/null -w '%{http_code} %{time_total}s %{size_download}B' -A 'oh-docs-corpus build-docs-corpus' --max-time 60 "$u" 2>&1 || true)
+            echo "$out  $u"
+          done
+          ip=$(curl -sS --max-time 20 https://api.ipify.org || true); echo "runner ip: ${ip%%.*}.x.x.x"
