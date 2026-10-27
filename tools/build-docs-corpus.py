@@ -59,6 +59,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -73,6 +74,8 @@ PREFIX = "zh-cn/application-dev/"
 PER_PAGE = 100
 MAX_PAGES = 1000
 ATTEMPTS = 3
+GET_ATTEMPTS = 4
+GET_TIMEOUT = 60
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEXPREFIX = re.compile(r"^[0-9a-f]{7,40}$")
@@ -192,9 +195,23 @@ class Http:
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler())
 
     def get(self, url: str) -> bytes:
+        # Every request retries a transient failure: a read timeout surfaces as a bare
+        # TimeoutError (not a URLError), and a GitHub runner abroad reaches gitcode's API
+        # slowly — the first CI dry run (run 40469004197) died on one unretried timeout
+        # while resolving the tree. A 4xx other than 429 is an answer, never retried.
         req = urllib.request.Request(url, headers={"User-Agent": "oh-docs-corpus build-docs-corpus"})
-        with self.opener.open(req, timeout=30) as r:
-            return r.read()
+        for attempt in range(GET_ATTEMPTS):
+            try:
+                with self.opener.open(req, timeout=GET_TIMEOUT) as r:
+                    return r.read()
+            except urllib.error.HTTPError as e:
+                if e.code != 429 and e.code < 500 or attempt == GET_ATTEMPTS - 1:
+                    raise
+            except (TimeoutError, ConnectionError, urllib.error.URLError):
+                if attempt == GET_ATTEMPTS - 1:
+                    raise
+            time.sleep(2 * (1 + attempt))
+        raise AssertionError("unreachable")
 
 
 def get_json(http, url: str):
