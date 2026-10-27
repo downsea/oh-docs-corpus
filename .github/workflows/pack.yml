@@ -1,0 +1,280 @@
+# pack.yml — build an OpenHarmony docs pack and publish it as a release of this repository.
+#
+# What it serves: `oh docs update --corpus openharmony` reads
+#   https://github.com/downsea/oh-docs-corpus/releases/latest/download/manifest.json
+# and then the asset the manifest names (oh ADR-0109). That consumer contract —
+# manifest fields, asset name `openharmony-zh-cn-<YYYYMMDD>-<commit8>.zip`, zip layout —
+# is owned by tools/build-docs-corpus.py and must not change here.
+#
+# Triggers (research docs/research/2026-10-27-ci-for-docs-packs.md §3):
+#   - workflow_dispatch  = DRY RUN: build + verify + upload a 1-day artifact. Never publishes.
+#   - push of a tag that is LITERALLY the release name, openharmony-zh-cn-<YYYYMMDD>-<commit8>
+#     = PUBLISH. The tag names the gitcode commit; `guard` resolves it and stops unless the
+#     name the build would get equals the tag byte for byte (the CONTRACT §6 "tag is literally
+#     v<version>" rule, applied to a data pack). Get the name with
+#     `python3 -I tools/build-docs-corpus.py --resolve` first.
+#   - No push / PR / schedule trigger (family no-push-CI rule).
+#
+# Family rules applied (downsea/ci-workflows CLAUDE.md hard rules + docs/CONTRACT.md):
+# ubuntu-22.04 only (rule 5); persist-credentials: false; no set -x, no secret at all —
+# this is a public repo and GITHUB_TOKEN publishes its own releases (rule 7, CREDENTIALS);
+# no pipeline whose reader can exit first (rule 8); permissions contents: read at the top,
+# contents: write only on `publish` (rule 9, CONTRACT §4); hand-off artifact with
+# retention-days: 1 (rule 10, §11); `<asset>.sha256` in sha256sum -c format (rule 4, §1).
+# This is a caller-owned workflow, not a ci-workflows reusable one: a public repository
+# cannot call a reusable workflow stored in a private repository (research §1).
+
+name: pack
+
+on:
+  push:
+    tags: ['openharmony-zh-cn-[0-9]+-[0-9a-f]+']
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'gitcode openharmony/docs commit (7-40 lowercase hex); empty = master now. Dry run only — never publishes.'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# One pack at a time: two publishes racing for releases/latest is the failure to prevent.
+concurrency:
+  group: pack
+  cancel-in-progress: false
+
+env:
+  # Absolute page floor; the effective floor is max(this, ceil(0.9 x the latest release's
+  # documents)) — tools/build-docs-corpus.py floor_of(). 5,964 pages at 2026-10-27.
+  MIN_DOCUMENTS: '5000'
+  LATEST_MANIFEST_URL: https://github.com/${{ github.repository }}/releases/latest/download/manifest.json
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      tag: ${{ steps.plan.outputs.tag }}
+      asset: ${{ steps.plan.outputs.asset }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Self-test (offline)
+        run: python3 -I tools/build-docs-corpus.py --self-test
+
+      - name: Guard — resolve the commit, name the pack, check it is publishable
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_COMMIT: ${{ inputs.commit }}
+        run: |
+          prev="$RUNNER_TEMP/previous-manifest.json"
+          if [[ "$EVENT" == push && "$REF_TYPE" == tag ]]; then
+            mode=publish
+            if [[ ! "$REF_NAME" =~ ^openharmony-zh-cn-[0-9]{8}-([0-9a-f]{8})$ ]]; then
+              echo "::error::tag '$REF_NAME' is not openharmony-zh-cn-<YYYYMMDD>-<commit8>; get the name with: python3 -I tools/build-docs-corpus.py --resolve"
+              exit 1
+            fi
+            ref="${BASH_REMATCH[1]}"
+          elif [[ "$EVENT" == workflow_dispatch ]]; then
+            mode=dry-run
+            if [[ ! "$INPUT_COMMIT" =~ ^([0-9a-f]{7,40})?$ ]]; then
+              echo "::error::input commit must be empty or 7-40 lowercase hex"
+              exit 1
+            fi
+            ref="$INPUT_COMMIT"
+          else
+            echo "::error::event $EVENT on $REF_TYPE '$REF_NAME' is neither a pack tag nor a dispatch; refusing to guess"
+            exit 1
+          fi
+
+          # The latest release's manifest — the same URL oh reads. It sets the 90% page
+          # floor and the "must be newer" rule. Missing is a stop on a publish (it would
+          # silently drop both protections), a warning on a dry run.
+          prev_args=()
+          if curl -fsSL --retry 3 --retry-delay 5 -o "$prev" "$LATEST_MANIFEST_URL"; then
+            prev_args=(--previous-manifest "$prev")
+          elif [[ "$mode" == publish ]]; then
+            echo "::error::could not fetch $LATEST_MANIFEST_URL; the page floor and the newer-than-latest check need it"
+            exit 1
+          else
+            echo "::warning::could not fetch $LATEST_MANIFEST_URL; dry run continues without the 90% floor and the newer check"
+          fi
+
+          commit_args=()
+          [[ -n "$ref" ]] && commit_args=(--commit "$ref")
+          plan=$(python3 -I tools/build-docs-corpus.py --resolve "${commit_args[@]}" "${prev_args[@]}")
+          PLAN="$plan" python3 -I -c '
+          import json, os
+          p = json.loads(os.environ["PLAN"])
+          for k in ("commit", "committed_at", "asset", "tag", "newer_than_previous"):
+              print(f"{k}={p[k]}")
+          ' >> "$GITHUB_OUTPUT"
+          tag=$(PLAN="$plan" python3 -I -c 'import json,os;print(json.loads(os.environ["PLAN"])["tag"])')
+          newer=$(PLAN="$plan" python3 -I -c 'import json,os;print(json.loads(os.environ["PLAN"])["newer_than_previous"])')
+
+          if [[ "$mode" == publish && "$tag" != "$REF_NAME" ]]; then
+            echo "::error::tag '$REF_NAME' resolves to pack '$tag' (gitcode commit date or prefix differs); push the name --resolve prints"
+            exit 1
+          fi
+
+          # Idempotency: a published release for this name is immutable (CONTRACT §13 L6),
+          # so a re-run is a no-op success; a leftover draft is a failed earlier publish
+          # and needs a human.
+          state=none
+          if draft=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null); then
+            if [[ "$draft" == true ]]; then state=draft; else state=published; fi
+          fi
+          publish=false
+          case "$mode/$state" in
+            publish/published)
+              echo "::notice::release $tag is already published; nothing to do (published assets are immutable)" ;;
+            publish/draft)
+              echo "::error::a DRAFT release $tag exists — an earlier publish failed half-way. Inspect it, then: gh release delete $tag -R $GITHUB_REPOSITORY --yes (keeps the tag) and re-run this workflow"
+              exit 1 ;;
+            publish/none)
+              if [[ "$newer" != True ]]; then
+                echo "::error::$tag is not newer than the latest release; publishing it would turn releases/latest back to older docs"
+                exit 1
+              fi
+              publish=true ;;
+            dry-run/*)
+              [[ "$state" != none ]] && echo "::warning::release $tag already exists ($state); a tag push for it would not publish again"
+              [[ "$newer" == False ]] && echo "::warning::$tag is not newer than the latest release; a tag push for it would be refused" ;;
+          esac
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          {
+            echo "### pack plan ($mode)"
+            echo ""
+            echo "- pack: \`$tag\` · release state: $state · newer than latest: $newer · will publish: $publish"
+            if [[ "$mode" == dry-run ]]; then
+              echo "- to publish this commit: \`git tag -a $tag -m '$tag' && git push origin $tag\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the pack (~6,100 anonymous gitcode GETs)
+        if: ${{ steps.plan.outputs.publish == 'true' || github.event_name == 'workflow_dispatch' }}
+        env:
+          COMMIT: ${{ steps.plan.outputs.commit }}
+        run: |
+          prev_args=()
+          [[ -s "$RUNNER_TEMP/previous-manifest.json" ]] && prev_args=(--previous-manifest "$RUNNER_TEMP/previous-manifest.json")
+          python3 -I tools/build-docs-corpus.py --out "$RUNNER_TEMP/pack" --commit "$COMMIT" \
+            --min-documents "$MIN_DOCUMENTS" "${prev_args[@]}" --pages-tsv "$RUNNER_TEMP/pages.tsv"
+
+      - name: Write the sha256 sidecar and verify the pack end to end
+        if: ${{ steps.plan.outputs.publish == 'true' || github.event_name == 'workflow_dispatch' }}
+        env:
+          ASSET: ${{ steps.plan.outputs.asset }}
+          PUBLISH: ${{ steps.plan.outputs.publish }}
+        run: |
+          (cd "$RUNNER_TEMP/pack" && sha256sum "$ASSET" > "$ASSET.sha256" && sha256sum -c "$ASSET.sha256")
+          args=(--verify "$RUNNER_TEMP/pack" --pages-tsv "$RUNNER_TEMP/pages.tsv"
+                --min-documents "$MIN_DOCUMENTS" --expect-asset "$ASSET")
+          [[ -s "$RUNNER_TEMP/previous-manifest.json" ]] && args+=(--previous-manifest "$RUNNER_TEMP/previous-manifest.json")
+          [[ "$PUBLISH" == true ]] && args+=(--require-newer)
+          report=$(python3 -I tools/build-docs-corpus.py "${args[@]}")
+          {
+            echo "### pack verified"
+            echo ""
+            echo '```json'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the hand-off artifact
+        if: ${{ steps.plan.outputs.publish == 'true' || github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: pack
+          path: ${{ runner.temp }}/pack/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' && needs.build.outputs.publish == 'true' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: pack
+          path: ${{ runner.temp }}/pack
+
+      - name: Re-verify what was handed off
+        env:
+          ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          (cd "$RUNNER_TEMP/pack" && sha256sum -c "$ASSET.sha256")
+          # releases/latest may have moved while `build` ran; check against it again.
+          curl -fsSL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/previous-manifest.json" "$LATEST_MANIFEST_URL"
+          python3 -I tools/build-docs-corpus.py --verify "$RUNNER_TEMP/pack" --min-documents "$MIN_DOCUMENTS" \
+            --expect-asset "$ASSET" --previous-manifest "$RUNNER_TEMP/previous-manifest.json" --require-newer
+
+      - name: Publish — draft, upload, then make it the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ASSET: ${{ needs.build.outputs.asset }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          dir="$RUNNER_TEMP/pack"
+          if draft=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json isDraft -q .isDraft 2>/dev/null); then
+            echo "::error::release $TAG appeared while this run was building (draft: $draft); not touching it"
+            exit 1
+          fi
+          RUN_URL="$RUN_URL" python3 -I - "$dir/manifest.json" "$RUNNER_TEMP/notes.md" "$RUNNER_TEMP/title.txt" <<'PY'
+          import json, os, sys
+          m = json.load(open(sys.argv[1], encoding="utf-8"))
+          c, d = m["commit"], m["committed_at"]
+          notes = (
+              f"Markdown files under `zh-cn/application-dev/` of [openharmony/docs]({m['source']}) "
+              f"at commit `{c}` ({d}), unmodified: {m['documents']:,} pages. "
+              "CC BY 4.0, see LICENSE and NOTICE in the archive. "
+              f"sha256 `{m['sha256']}` ({m['bytes']:,} bytes; also `{m['asset']}.sha256`). "
+              f"Built and published by this repository's `pack` workflow from `tools/build-docs-corpus.py` "
+              f"at `{os.environ['GITHUB_SHA']}` ({os.environ['RUN_URL']}); "
+              "consumed by `oh docs update --corpus openharmony` (oh ADR-0109).\n"
+          )
+          open(sys.argv[2], "w", encoding="utf-8").write(notes)
+          open(sys.argv[3], "w", encoding="utf-8").write(f"OpenHarmony zh-cn docs {d[:10]} ({c[:8]})")
+          PY
+          title=$(< "$RUNNER_TEMP/title.txt")
+          # Draft first: a draft is never releases/latest, so an upload that dies half-way
+          # cannot hand oh a manifest whose asset is missing.
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$title" --notes-file "$RUNNER_TEMP/notes.md" \
+            "$dir/$ASSET" "$dir/$ASSET.sha256" "$dir/manifest.json"
+          gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --draft=false --latest
+          echo "### published [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read it back the way oh does
+        env:
+          ASSET: ${{ needs.build.outputs.asset }}
+        run: |
+          # Advisory: the release is already public; a lag here is reported, not failed.
+          got="$RUNNER_TEMP/latest-manifest.json"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL -o "$got" "$LATEST_MANIFEST_URL" && cmp -s "$got" "$RUNNER_TEMP/pack/manifest.json"; then
+              echo "releases/latest/download/manifest.json now serves $ASSET"
+              exit 0
+            fi
+            sleep $((i * 10))
+          done
+          echo "::warning::releases/latest/download/manifest.json does not serve $ASSET yet; check by hand"
