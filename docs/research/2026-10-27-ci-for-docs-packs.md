@@ -205,7 +205,7 @@ CI 转正时会用 manifest 生成的标题和 notes 覆盖 draft 上的标题�
 
 **只有真跑一次 workflow 才能证明**：
 
-- U1 runner 上列目录树的耗时：之前读到约 10 分钟，`timeout-minutes: 40` 预计够用；API 请求会不会也被 418，未知。
+- U1 ~~runner 上列目录树的耗时~~ **已验（2026-10-27）**：run 40480014752 第一个 API 请求就是 429，4 次退避后放弃；改成按 `Retry-After` 或 15 s 起翻倍、最多 6 次之后，run 40480464912 对已发布包 `aad3246e` 跑 dispatch 验证**成功，858 s**（在 40 分钟时限内）。限流是常态，退避是必需的。
 - U2 `contents: write` 的 `GITHUB_TOKEN` 能否用 `gh release view/download <tag>` 读到 **draft**（按文档应当可以）。
 - U3 `gh release create --draft` 能否为远端尚不存在的 tag 建 draft；推 tag 后，`gh release edit --verify-tag --draft=false --latest`
   能否把它挂到这个 tag 上并标为 latest。
@@ -259,3 +259,5 @@ gitcode 目录树是独立于打包人的第三方事实。CI 不必信任上传
 > **Exit**：上述措辞落地，`tools/check-docs.py` 保持绿；oh-docs-corpus 的 `pack.yml` 头注改为引用那一节。
 >
 > **反向链接**：oh-docs-corpus `docs/research/2026-10-27-ci-for-docs-packs.md`；oh-cli ADR-0109 / #741。
+
+**补记（2026-10-27 晚）**：新路线下的第一次真跑。run 40479809263 6 s 失败：第一份手工发布的 release 缺 `.sha256` 资产，已补传，内容等于 manifest 的 sha256。run 40480014752 128 s 失败：gitcode API 回 429，当时的退避太短。run 40480464912 **成功，858 s**：sha256 OK，5,964 篇对照 gitcode 目录树验证通过。发布路径（draft → 推 tag → 转正）还没真跑过，要等下一次真正发版才能证明（U2 / U3 / U5）。
