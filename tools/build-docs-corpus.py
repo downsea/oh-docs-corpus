@@ -76,6 +76,7 @@ MAX_PAGES = 1000
 ATTEMPTS = 3
 GET_ATTEMPTS = 4
 GET_TIMEOUT = 60
+THROTTLE_BACKOFF = 15
 FIXED_TIME = (1980, 1, 1, 0, 0, 0)
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEXPREFIX = re.compile(r"^[0-9a-f]{7,40}$")
@@ -205,8 +206,15 @@ class Http:
                 with self.opener.open(req, timeout=GET_TIMEOUT) as r:
                     return r.read()
             except urllib.error.HTTPError as e:
-                if e.code != 429 and e.code < 500 or attempt == GET_ATTEMPTS - 1:
+                # 429 and gitcode's 418 are throttling (a hosted runner got a 418 on
+                # its first raw GET right after ~130 API calls, run 40469395436, while
+                # a lone probe from a fresh runner got 200s): back off for longer.
+                throttled = e.code in (418, 429)
+                if not throttled and e.code < 500 or attempt == GET_ATTEMPTS - 1:
                     raise
+                if throttled:
+                    time.sleep(THROTTLE_BACKOFF * (2**attempt))
+                    continue
             except (TimeoutError, ConnectionError, urllib.error.URLError):
                 if attempt == GET_ATTEMPTS - 1:
                     raise
